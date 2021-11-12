@@ -19,9 +19,9 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   genmsg
   message_generation
-franka_core_msgs
+
 gazebo_msgs
-franka_moveit
+
 
 )
 if(NOT EIGEN3_INCLUDE_DIRS)
@@ -58,14 +58,13 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "../bin")
   add_executable(${example} "src/${example}.cpp" )
   target_link_libraries(${example} Franka::Franka examples_common Controller ${Eigen_INCLUDE_DIRS} ${catkin_LIBRARIES}  ${ROS_LIBRARIES} jsoncpp)
 find_package(catkin REQUIRED COMPONENTS
-franka_core_msgs
+
   roscpp
   std_msgs
   genmsg
   message_generation
-  franka_core_msgs
 gazebo_msgs
-franka_moveit
+
 
   
 )
