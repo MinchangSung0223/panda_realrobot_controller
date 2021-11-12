@@ -16,6 +16,8 @@
 #include <sensor_msgs/JointState.h>
 #include <franka/robot.h>
 #include "examples_common.h"
+ros::Publisher pub_joint;
+sensor_msgs::JointState joint_msg;
 std::array<double, 7> q_goal2 = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4+0.05}};
 void rosDesiredJointStateCallback(const sensor_msgs::JointState::ConstPtr& msg)
 {
@@ -64,12 +66,35 @@ int main(int argc, char** argv) {
   std::atomic_bool running{true};
   // Start print thread.
   std::thread print_thread([print_rate, &print_data, &running]() {
+	ros::Time::init();
 
     while (running) {
       // Sleep to achieve the desired print rate.
       std::this_thread::sleep_for(
           std::chrono::milliseconds(static_cast<int>((1.0 / print_rate * 1000.0))));
-				
+	if(ros::ok()){
+		joint_msg = sensor_msgs::JointState();
+		joint_msg.header.stamp = ros::Time::now();
+		joint_msg.name.push_back("panda_joint1");
+		joint_msg.name.push_back("panda_joint2");
+		joint_msg.name.push_back("panda_joint3");
+		joint_msg.name.push_back("panda_joint4");
+		joint_msg.name.push_back("panda_joint5");
+		joint_msg.name.push_back("panda_joint6");
+		joint_msg.name.push_back("panda_joint7");
+		joint_msg.position.push_back(print_data.robot_state.q[0]);
+		joint_msg.position.push_back(print_data.robot_state.q[1]);
+		joint_msg.position.push_back(print_data.robot_state.q[2]);
+		joint_msg.position.push_back(print_data.robot_state.q[3]);
+		joint_msg.position.push_back(print_data.robot_state.q[4]);
+		joint_msg.position.push_back(print_data.robot_state.q[5]);
+		joint_msg.position.push_back(print_data.robot_state.q[]);
+
+
+
+		pub_joint.publish(joint_msg);
+	}
+
       // Try to lock data to avoid read write collisions.
       if (print_data.mutex.try_lock()) {
         if (print_data.has_data) {
@@ -109,6 +134,8 @@ int main(int argc, char** argv) {
 ros::NodeHandle nh;
 
 	ros::Subscriber desired_sub = nh.subscribe("/desired_joint_states", 1,rosDesiredJointStateCallback); 
+	pub_joint =  nh.advertise<sensor_msgs::JointState>("/joint_states", 1); 
+    ros::Rate r(10000);
     // First move the robot to a suitable joint configuration
     std::array<double, 7> q_goal = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}};
 
@@ -174,7 +201,7 @@ ros::NodeHandle nh;
     // Define callback for the joint torque control loop.
     std::function<franka::Torques(const franka::RobotState&, franka::Duration)>
         impedance_control_callback =
-            [&print_data, &model, k_gains, d_gains](
+            [&print_data, &model, k_gains, d_gains,&r](
                 const franka::RobotState& state, franka::Duration /*period*/) -> franka::Torques {
       // Read current coriolis terms from model.
       std::array<double, 7> coriolis = model.coriolis(state);
@@ -186,7 +213,10 @@ ros::NodeHandle nh;
         tau_d_calculated[i] =
             k_gains[i] * (q_goal2[i] - state.q[i]) - d_gains[i] * state.dq[i] + coriolis[i];
       }
+
+
 	ros::spinOnce();
+	r.sleep();
       // The following line is only necessary for printing the rate limited torque. As we activated
       // rate limiting for the control loop (activated by default), the torque would anyway be
       // adjusted!
