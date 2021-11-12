@@ -1,178 +1,217 @@
 // Copyright (c) 2017 Franka Emika GmbH
 // Use of this source code is governed by the Apache-2.0 license, see LICENSE
+#include <array>
+#include <atomic>
 #include <cmath>
-#include <fstream>
-#include <iomanip>
+#include <functional>
 #include <iostream>
 #include <iterator>
-#include <vector>
+#include <mutex>
 #include <ros/ros.h>
-#include <sensor_msgs/JointState.h>
-#include <stdio.h>
-#include <signal.h>
-#include "spline.h"
+#include <thread>
+#include <franka/duration.h>
 #include <franka/exception.h>
-#include <franka/robot.h>
 #include <franka/model.h>
 #include <franka/rate_limiting.h>
-#include <franka_core_msgs/JointCommand.h>
-#include <franka_core_msgs/RobotState.h>
-
+#include <sensor_msgs/JointState.h>
+#include <franka/robot.h>
 #include "examples_common.h"
-#include "Controller.h"
-
-#include <iostream>
-#include <fstream> 
-#include <jsoncpp/json/json.h>
-#pragma comment(lib, "jsoncpp.lib")
-using namespace std;
-typedef std::array<double,7> J;
-J joint_states={0,0,0,0,0,0,0};
-J q_d = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}};
-J dq_d = {0,};
-J coriolis={0,};
-void ctrlchandler(int){exit(EXIT_SUCCESS);}
-void killhandler(int){exit(EXIT_SUCCESS);}
-franka::RobotState robot_state;
-bool desired_recv=false;
-bool is_sim = true;
-
+std::array<double, 7> q_goal2 = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4+0.05}};
 void rosDesiredJointStateCallback(const sensor_msgs::JointState::ConstPtr& msg)
 {
-	for(int i = 0;i<7;i++){
-		q_d.at(i) = msg->position[i];
-		dq_d.at(i) = msg->position[i];
+	for(int i= 0;i<7;i++){
+		q_goal2.at(i) = msg->position[i];
 	}
-}
 
-void printJ(J input,char* str){
-	std::cout<<"\t"<<str<<" : ";
-	for(int i = 0;i<6;i++)
-		std::cout<<input.at(i)<<",";
-	std::cout<<input.at(6)<<std::endl;
-}
-
-
-bool ReadFromFile(const char* filename, char* buffer, int len){
-	FILE* r = fopen(filename,"rb");
-	if (NULL == r)
-	   return false;
-	size_t fileSize = fread(buffer, 1, len, r);
-	fclose(r);
-	return true;
-
-}
-bool loadJson(Json::Value& input,char* JSON_FILE){
-	const int BufferLength = 102400;
-	char readBuffer[BufferLength] = {0,};
-	if (false == ReadFromFile(JSON_FILE, readBuffer, BufferLength)) 
-	  return 0;
-	std::string config_doc = readBuffer;
-
-	Json::Reader reader;
-	bool parsingSuccessful = reader.parse(config_doc,input);
-	if ( !parsingSuccessful ) { 
-	std::cout << "Failed to parse configuration\n" << reader.getFormatedErrorMessages(); 
-	return 0; 
-	}
-	return 1;
 
 }
 
+namespace {
+template <class T, size_t N>
+std::ostream& operator<<(std::ostream& ostream, const std::array<T, N>& array) {
+  ostream << "[";
+  std::copy(array.cbegin(), array.cend() - 1, std::ostream_iterator<T>(ostream, ","));
+  std::copy(array.cend() - 1, array.cend(), std::ostream_iterator<T>(ostream));
+  ostream << "]";
+  return ostream;
+}
+}  // anonymous namespace
 
 int main(int argc, char** argv) {
-	if(argc == 2){
+  // Check whether the required arguments were passed.
+  if (argc != 2) {
+    std::cerr << "Usage: " << argv[0] << " <robot-hostname>" << std::endl;
+    return -1;
+  }
+  // Set and initialize trajectory parameters.
+  const double radius = 0.05;
+  const double vel_max = 0.25;
+  const double acceleration_time = 2.0;
+  const double run_time = 20.0;
+  // Set print rate for comparing commanded vs. measured torques.
+  const double print_rate = 10.0;
+  double vel_current = 0.0;
+  double angle = 0.0;
+  double time = 0.0;
+  // Initialize data fields for the print thread.
+  struct {
+    std::mutex mutex;
+    bool has_data;
+    std::array<double, 7> tau_d_last;
+    franka::RobotState robot_state;
+    std::array<double, 7> gravity;
+  } print_data{};
+  std::atomic_bool running{true};
+  // Start print thread.
+  std::thread print_thread([print_rate, &print_data, &running]() {
 
-	}else{
-		std::cout<<"###PLEASE JSON FILE NAME###"<<std::endl;
-		std::cout<<"./controller <json file name> "<<std::endl;
-		return -1;
-	}
+    while (running) {
+      // Sleep to achieve the desired print rate.
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(static_cast<int>((1.0 / print_rate * 1000.0))));
+				
+      // Try to lock data to avoid read write collisions.
+      if (print_data.mutex.try_lock()) {
+        if (print_data.has_data) {
+          std::array<double, 7> tau_error{};
+          double error_rms(0.0);
+          std::array<double, 7> tau_d_actual{};
+          for (size_t i = 0; i < 7; ++i) {
+            tau_d_actual[i] = print_data.tau_d_last[i] + print_data.gravity[i];
+            tau_error[i] = tau_d_actual[i] - print_data.robot_state.tau_J[i];
+            error_rms += std::pow(tau_error[i], 2.0) / tau_error.size();
+          }
+          error_rms = std::sqrt(error_rms);
+          // Print data to console
+         // std::cout << "tau_error [Nm]: " << tau_error << std::endl
+          //          << "tau_commanded [Nm]: " << tau_d_actual << std::endl
+           //         << "tau_measured [Nm]: " << print_data.robot_state.tau_J << std::endl
+           //         << "root mean square of tau_error [Nm]: " << error_rms << std::endl
+           //         << "-----------------------" << std::endl;
+	   std::cout<<q_goal2[0]<<","<<q_goal2[1]<<","<<q_goal2[2]<<","
+<<q_goal2[3]<<","<<q_goal2[4]<<","<<q_goal2[5]<<","<<q_goal2[6]<<","<<std::endl;
+          print_data.has_data = false;
+        }
+        print_data.mutex.unlock();
+      }
+    }
+  });
+  try {
 
-    //***************************JSON LOAD START****************************************//
-    char* JSON_FILE= argv[1];
-    std::string robot_name = "panda_robot";
 
-	Json::Value rootr;
-	bool ret = loadJson(rootr, JSON_FILE);
+    // Connect to robot.
+    franka::Robot robot(argv[1]);
+    setDefaultBehavior(robot);
+   int argc;
+   char** argv;
+   ros::init(argc,argv,"trajectory_subscriber");
 
-    J q_goal = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}};
-	if(ret == 1)
-		for(int i = 0;i<7;i++)
-			q_goal.at(i) = rootr[robot_name]["init_q"][i].asFloat();
-	else
-		return 0;
-	for(int i = 0;i<7;i++)
-		robot_state.q_d.at(i) =q_goal.at(i);
+ros::NodeHandle nh;
 
-	std::string robot_ip = rootr[robot_name]["robot_ip"].asString();
-
-
-
-
-
-    //***************************JSON LOAD END****************************************//
-
-
-	try{ros::init(argc,argv,"trajectory_subscriber");}
-	catch(int e){ctrlchandler(1);}
-
-
-	ros::NodeHandle nh;
 	ros::Subscriber desired_sub = nh.subscribe("/desired_joint_states", 1,rosDesiredJointStateCallback); 
+    // First move the robot to a suitable joint configuration
+    std::array<double, 7> q_goal = {{0, -M_PI_4, 0, -3 * M_PI_4, 0, M_PI_2, M_PI_4}};
 
-	ros::Rate r(1000);
-	std::cout<<"ROS JOINT CONTROLLER IS ON"<<std::endl;
-
-	unsigned int count = 0;
-		//*******************************************REAL ROBOT****************************************************************//
-		struct {
-			
-		} print_data{};
-		try{
-
-			franka::Robot robot(robot_ip);
-			setDefaultBehavior(robot);
-			std::cout << "Conection Established"<<std::endl;
-	    	MotionGenerator motion_generator(0.5, q_goal);
-			std::cout << "경고: 이 예제는 로봇이 움직입니다. "
-			          << "EMERGENCY버튼을 손에 들고 있어주세요" << std::endl
-			          << "Enter키를 누르면 시직합니다." << std::endl;
-			std::cin.ignore();
-			robot.control(motion_generator);
-		    robot.setCollisionBehavior(
-	        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-	        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-	        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}},
-	        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}});
-			const std::array<double, 7> k_gains = {{600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0}};
-			const std::array<double, 7> d_gains = {{50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0}};
-		    franka::Model model = robot.loadModel();
-			while (ros::ok()){
-
-					std::function<franka::Torques(const franka::RobotState&, franka::Duration)> impedance_control_callback =
-			        [&print_data, &model, k_gains, d_gains](const franka::RobotState& state, franka::Duration /*period*/) -> franka::Torques {
-						// Read current coriolis terms from model.
-						std::array<double, 7> coriolis = model.coriolis(state);
-						std::array<double, 7> tau_d_calculated;
-						for (size_t i = 0; i < 7; i++) {
-						tau_d_calculated[i] =
-						    k_gains[i] * (q_d[i] - state.q[i]) - d_gains[i] * dq_d[i] + coriolis[i];
-						}
-						std::array<double, 7> tau_d_rate_limited =
-						        franka::limitRate(franka::kMaxTorqueRate, tau_d_calculated, state.tau_J_d);
-						// Send torque command.
-						return tau_d_rate_limited;
-				};
-	   			
-	   			robot.control(impedance_control_callback);
-				ros::spinOnce();
-				r.sleep();
-			}
-		} catch (const franka::Exception& ex) {
-		    std::cerr << ex.what() << std::endl;
-		  }
-
+    MotionGenerator motion_generator(0.5, q_goal);
+    std::cout << "WARNING: This example will move the robot! "
+              << "Please make sure to have the user stop button at hand!" << std::endl
+              << "Press Enter to continue..." << std::endl;
+    std::cin.ignore();
+    robot.control(motion_generator);
+    std::cout << "Finished moving to initial joint configuration." << std::endl;
+    // Set additional parameters always before the control loop, NEVER in the control loop!
+    // Set collision behavior.
+    robot.setCollisionBehavior(
+        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
+        {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}}, {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
+        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}},
+        {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}}, {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}});
+    // Load the kinematics and dynamics model.
+    franka::Model model = robot.loadModel();
+    std::array<double, 16> initial_pose;
+    // Define callback function to send Cartesian pose goals to get inverse kinematics solved.
+    auto cartesian_pose_callback = [=, &time, &vel_current, &running, &angle, &initial_pose](
+                                       const franka::RobotState& robot_state,
+                                       franka::Duration period) -> franka::CartesianPose {
+      // Update time.
+      time += period.toSec();
+      if (time == 0.0) {
+        // Read the initial pose to start the motion from in the first time step.
+        initial_pose = robot_state.O_T_EE_c;
+      }
+      // Compute Cartesian velocity.
+      if (vel_current < vel_max && time < run_time) {
+        vel_current += period.toSec() * std::fabs(vel_max / acceleration_time);
+      }
+      if (vel_current > 0.0 && time > run_time) {
+        vel_current -= period.toSec() * std::fabs(vel_max / acceleration_time);
+      }
+      vel_current = std::fmax(vel_current, 0.0);
+      vel_current = std::fmin(vel_current, vel_max);
+      // Compute new angle for our circular trajectory.
+      angle += period.toSec() * vel_current / std::fabs(radius);
+      if (angle > 2 * M_PI) {
+        angle -= 2 * M_PI;
+      }
+      // Compute relative y and z positions of desired pose.
+      double delta_y = radius * (1 - std::cos(angle));
+      double delta_z = radius * std::sin(angle);
+      franka::CartesianPose pose_desired = initial_pose;
+      pose_desired.O_T_EE[13] += delta_y;
+      pose_desired.O_T_EE[14] += delta_z;
+      // Send desired pose.
+      if (time >= run_time + acceleration_time) {
+        running = false;
+        return franka::MotionFinished(pose_desired);
+      }
+      return pose_desired;
+    };
+    // Set gains for the joint impedance control.
+    // Stiffness
+    const std::array<double, 7> k_gains = {{600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0}};
+    // Damping
+    const std::array<double, 7> d_gains = {{50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0}};
+    // Define callback for the joint torque control loop.
+    std::function<franka::Torques(const franka::RobotState&, franka::Duration)>
+        impedance_control_callback =
+            [&print_data, &model, k_gains, d_gains](
+                const franka::RobotState& state, franka::Duration /*period*/) -> franka::Torques {
+      // Read current coriolis terms from model.
+      std::array<double, 7> coriolis = model.coriolis(state);
+      // Compute torque command from joint impedance control law.
+      // Note: The answer to our Cartesian pose inverse kinematics is always in state.q_d with one
+      // time step delay.
+      std::array<double, 7> tau_d_calculated;
+      for (size_t i = 0; i < 7; i++) {
+        tau_d_calculated[i] =
+            k_gains[i] * (q_goal2[i] - state.q[i]) - d_gains[i] * state.dq[i] + coriolis[i];
+      }
+	ros::spinOnce();
+      // The following line is only necessary for printing the rate limited torque. As we activated
+      // rate limiting for the control loop (activated by default), the torque would anyway be
+      // adjusted!
+      std::array<double, 7> tau_d_rate_limited =
+          franka::limitRate(franka::kMaxTorqueRate, tau_d_calculated, state.tau_J_d);
+      // Update data to print.
+      if (print_data.mutex.try_lock()) {
+        print_data.has_data = true;
+        print_data.robot_state = state;
+        print_data.tau_d_last = tau_d_rate_limited;
+        print_data.gravity = model.gravity(state);
+        print_data.mutex.unlock();
+      }
+      // Send torque command.
+      return tau_d_rate_limited;
+    };
+    // Start real-time control loop.
+    robot.control(impedance_control_callback);
+  } catch (const franka::Exception& ex) {
+    running = false;
+    std::cerr << ex.what() << std::endl;
+  }
+  if (print_thread.joinable()) {
+    print_thread.join();
+  }
+  return 0;
 }
-
 
