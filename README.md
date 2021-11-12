@@ -26,3 +26,11 @@
     cmake ..
     make -j16
 ```
+
+
+
+
+```bash
+cd /home/robot/workspace_HYU/panda_realrobot_controller
+./bin/main 172.16.0.2
+```
